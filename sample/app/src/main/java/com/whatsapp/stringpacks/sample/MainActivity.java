@@ -10,6 +10,7 @@ import android.content.Context;
 import android.content.res.Resources;
 import android.os.Bundle;
 import android.view.View;
+import android.webkit.WebView;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Spinner;
@@ -29,6 +30,7 @@ public class MainActivity extends AppCompatActivity
     implements LanguageChangeHandler.OnDeviceLocaleChangeListener {
 
   TextView textView;
+  WebView webView;
 
   private @Nullable StringPackResources stringPackResources;
   private @Nullable ArrayAdapter<CharSequence> adapter;
@@ -41,6 +43,9 @@ public class MainActivity extends AppCompatActivity
 
     textView = findViewById(R.id.text_view);
     textView.setText(R.string.hello_world);
+
+    webView = findViewById(R.id.web_view);
+    webView.loadData(getString(R.string.hello_world), "text/html; charset=utf-8", "utf-8");
 
     LanguageChangeHandler.getInstance().registerOnDeviceLocaleChangeListeners(this);
 
