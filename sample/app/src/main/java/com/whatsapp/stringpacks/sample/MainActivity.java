@@ -45,7 +45,23 @@ public class MainActivity extends AppCompatActivity
     textView.setText(R.string.hello_world);
 
     webView = findViewById(R.id.web_view);
-    webView.loadData(getString(R.string.hello_world), "text/html; charset=utf-8", "utf-8");
+    String data = "Select Month: "
+                  + "<select id='month'>"
+                  + "<option value='1'>January</option>"
+                  + "<option value='2'>February</option>"
+                  + "<option value='3'>March</option>"
+                  + "<option value='4'>April</option>"
+                  + "<option value='5'>May</option>"
+                  + "<option value='6'>June</option>"
+                  + "<option value='7'>July</option>"
+                  + "<option value='8'>August</option>"
+                  + "<option value='9'>September</option>"
+                  + "<option value='10'>October</option>"
+                  + "<option value='11'>November</option>"
+                  + "<option value='12'>December</option>"
+                  + "</select>";
+
+    webView.loadData(data, "text/html; charset=utf-8", "utf-8");
 
     LanguageChangeHandler.getInstance().registerOnDeviceLocaleChangeListeners(this);
 
