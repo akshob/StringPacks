@@ -3,13 +3,16 @@
 # This source code is licensed under the Apache 2.0 license found in
 # the LICENSE file in the root directory of this source tree.
 
+import argparse
 import collections
 import logging
 import os
 import re
 import sys
+from typing import Dict, List, Set
 from xml.etree import ElementTree
 
+from id_finder import IdFinder
 
 # This must be kept in sync with the `quantityIndex()` method in ParsedStringPack.java
 _IDS_FOR_QUANTITY = {"other": 0, "zero": 1, "one": 2, "two": 3, "few": 4, "many": 5}
@@ -33,7 +36,7 @@ def extract_locale_from_file_name(file_name):
     return normalize_locale(match.group(1))
 
 
-def unescape(text):
+def unescape(text) -> str:
     if not text:
         return ""
     if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
@@ -55,7 +58,9 @@ class TreeBuilderWithComments(ElementTree.TreeBuilder):
         self.end(self.COMMENT_TAG)
 
 
-def read_string_dict(locale, file_name, id_finder, plural_handler):
+def read_string_dict(
+    locale, file_name, id_finder, plural_handler, nullify_res_ids: Set = set()
+):
     result_dict = {}
     try:
         root = ElementTree.parse(
@@ -82,14 +87,17 @@ def read_string_dict(locale, file_name, id_finder, plural_handler):
             # but still remains in the translations (such strings will be cleaned up next time
             # move_strings_for_packing.py is run). Log a warning and skip the string.
             sys.stderr.write(
-                "No ID found for '%s' while packing %s\n" % (string_name, file_name)
+                f"No ID found for '{string_name}' while packing {file_name}\n"
             )
             continue
         if element.tag == "string":
-            text = element.text
-            result_dict[id] = unescape(text)
+            if f"R.string.{string_name}" in nullify_res_ids:
+                continue
+            result_dict[id] = unescape(element.text)
         else:  # plurals
             plural_dict = {}
+            if f"R.plurals.{string_name}" in nullify_res_ids:
+                continue
             for item in element:
                 assert item.tag == "item"
                 quantity = item.attrib["quantity"]
@@ -102,7 +110,7 @@ def read_string_dict(locale, file_name, id_finder, plural_handler):
 
 
 def blob_append_32_bit(blob, integer):
-    assert 0 <= integer < 2 ** 31
+    assert 0 <= integer < 2**31
     blob.append(integer & 0xFF)
     blob.append((integer & 0xFF00) >> 8)
     blob.append((integer & 0xFF0000) >> 16)
@@ -110,7 +118,7 @@ def blob_append_32_bit(blob, integer):
 
 
 def blob_append_16_bit(blob, integer):
-    assert 0 <= integer < 2 ** 15
+    assert 0 <= integer < 2**15
     blob.append(integer & 0xFF)
     blob.append((integer & 0xFF00) >> 8)
 
@@ -212,6 +220,8 @@ class LocaleStore(object):
 
 # Keep in sync with `ENCODINGS` in ParsedStringPack.java
 _ENCODING_ID = {"UTF-8": 0, "UTF-16BE": 1}
+# Keep in sync with `_ENCODING_ID`
+_ENCODING_INDEX = {0: "UTF-8", 1: "UTF-16BE"}
 
 # 2 bytes for number of locales, 4 bytes for starting index of locale data, 1 byte for the encoding
 # of string data, and 4 bytes for starting index of the string data. Totalling 11 bytes.
@@ -223,24 +233,154 @@ _HEADER_SIZE = 11
 _LOCALE_HEADER_SIZE = 11
 
 
+def _read(content: bytearray, offset: int, length: int = 1) -> int:
+    return int.from_bytes(content[offset : offset + length], "little")
+
+
+def _read_locale_from(content: bytearray, offset: int) -> str:
+    if _read(content, offset + 2) == 0:
+        length = 2
+    elif _read(content, offset + 5) == 0:
+        length = 5
+    else:
+        length = 7
+    return content[offset : offset + length].decode("ascii")
+
+
+def _loadString(
+    content: bytearray, mapped_id: int, startOfStringData: int, encoding: str
+) -> str:
+    caret = mapped_id
+    stringStart = _read(content, caret, 4)
+    caret += 4  # Increment to 4 Bytes which we read above for string starting location
+    stringLen = _read(content, caret, 2)
+    offset = startOfStringData + stringStart
+    return content[offset : offset + stringLen].decode(encoding)
+
+
+def _loadPlural(
+    content: bytearray, mapped_id: int, startOfStringData: int, encoding: str
+) -> Dict:
+    caret = mapped_id
+    quantityCount = _read(content, caret)
+    caret += 1  # Increment by a single byte which are for quantity count
+    pluralMap = {}
+    for _ in range(quantityCount):
+        quantityId = _read(content, caret)
+        caret += 1  # Increment by a single byte which are for quantity id
+        stringStart = _read(content, caret, 4)
+        caret += (
+            4  # Increment to 4*8 Bits which we read above for plural starting location
+        )
+        stringLen = _read(content, caret, 2)
+        caret += 2  # Increment to 2*8 Bits which we read above for plural length
+        offset = startOfStringData + stringStart
+        pluralMap[quantityId] = content[offset : offset + stringLen].decode(encoding)
+    return pluralMap
+
+
+def _map_translations(
+    content: bytearray, startOfLocaleData: int, headerStart: int
+) -> Dict:
+    caret = startOfLocaleData + headerStart
+    numStrings = _read(content, caret, 2)
+    caret += 2
+    numPlurals = _read(content, caret, 2)
+    caret += 2
+    result = {"string": {}, "plurals": {}}
+    for _ in range(numStrings):
+        id = _read(content, caret, 2)
+        caret += 2
+        result["string"][id] = caret
+        # Increment by 6 Bytes which is string starting location (4) + string length (2)
+        # to be read later when string is fetched
+        caret += 6
+
+    for _ in range(numPlurals):
+        id = _read(content, caret, 2)
+        caret += 2
+        result["plurals"][id] = caret
+        quantityCount = _read(content, caret)
+        caret += 1  # Increment by a single byte which are for quantity count read above
+        for __ in range(quantityCount):
+            # Increment by 7 Bytes which is the
+            # quantity id (1) + string starting location (4) + string length (2) to be
+            # read later when plural is fetched
+            caret += 7
+    return result
+
+
+class TranslationDict(object):
+    def __init__(self):
+        self.store = collections.defaultdict(dict)
+
+    def add_for_locale(self, locale, string_dict: Dict):
+        locale_dict = self.store[locale]
+        for key, value in string_dict.items():
+            # TODO: Uncomment this once the Warning is fixed. Commenting it temporarily as
+            # it throws a whole lots of Warnings that are non-actionable
+            # if key in locale_dict:
+            #    logging.warning(
+            #        "Warning: id {} being overridden by:{}, previous value:{}".format(
+            #            key, value, locale_dict[key]
+            #        )
+            #    )
+            locale_dict[key] = value
+
+    def add_translation(self, translation_dict: Dict):
+        for locale, dictionary in translation_dict.items():
+            self.add_for_locale(locale, dictionary)
+
+    def remove_unused_translation(self, id_finder: IdFinder, unused_strings: List):
+        for locale_dict in self.store.values():
+            for unused_string in unused_strings:
+                id = id_finder.get_id(unused_string)
+                if id is not None and id in locale_dict:
+                    del locale_dict[id]
+
+
 class StringPack(object):
     "The full string pack, with information about locales, ids, plurals, etc"
 
-    def __init__(self, encoding):
+    def __init__(self, encoding: str, translation: TranslationDict):
         assert encoding in _ENCODING_ID
         self.encoding = encoding
-        self.store = collections.defaultdict(dict)
+        self.store = translation.store
 
-    def add_for_locale(self, locale, string_dict):
-        locale_dict = self.store[locale]
-        for key, value in string_dict.items():
-            if key in locale_dict:
-                logging.warning(
-                    "Warning: id {} being overridden by:{}, previous value:{}".format(
-                        key, value, locale_dict[key]
-                    )
+    @staticmethod
+    def from_file(file_name: str) -> Dict:
+        with open(file_name, mode="rb") as file:  # b is important -> binary
+            content = file.read()
+        numLocales = _read(content, 0, 2)
+        startOfLocaleData = _read(content, 2, 4)
+        encodingId = _read(content, 6)
+        assert encodingId in _ENCODING_INDEX.keys(), "Unrecognized encoding"
+        encoding = _ENCODING_INDEX[encodingId]
+        startOfStringData = _read(content, 7, 4)
+
+        caret = _HEADER_SIZE
+        locale_starts = {}
+        for _ in range(numLocales):
+            resourceLocale = _read_locale_from(content, caret)
+            locale_starts[resourceLocale] = caret
+            caret += _LOCALE_HEADER_SIZE
+        translation_dict = {}
+        for locale, locale_start in locale_starts.items():
+            locale_dict = {}
+            translation_dict[locale] = locale_dict
+            headerStart = _read(content, locale_start + 7, 4)
+            mapping = _map_translations(content, startOfLocaleData, headerStart)
+            string_mapping = mapping["string"]
+            for android_id, string_pack_id in string_mapping.items():
+                locale_dict[android_id] = _loadString(
+                    content, string_pack_id, startOfStringData, encoding
                 )
-            locale_dict[key] = value
+            plural_mapping = mapping["plurals"]
+            for android_id, string_pack_id in plural_mapping.items():
+                locale_dict[android_id] = _loadPlural(
+                    content, string_pack_id, startOfStringData, encoding
+                )
+        return translation_dict
 
     def compile(self):
         self.string_buffer = StringBuffer(encoding=self.encoding)
@@ -283,22 +423,76 @@ class StringPack(object):
             pack_file.write(self.string_buffer.store)
 
 
-def build(input_file_names, output_file_name, id_finder, plural_handler):
+def build_with_dict(output_file_name: str, translation_dict: TranslationDict) -> None:
     """Builds the string pack and writes it to a file.
 
     It tries both UTF-8 and UTF-16 to see which one is smaller, and then writes
     the string pack in that encoding."""
     packs = []
     for encoding in _ENCODING_ID.keys():
-        full_store = StringPack(encoding=encoding)
-        for input_file_name in input_file_names:
-            locale = extract_locale_from_file_name(input_file_name)
-            full_store.add_for_locale(
-                locale,
-                read_string_dict(locale, input_file_name, id_finder, plural_handler),
-            )
+        full_store = StringPack(encoding=encoding, translation=translation_dict)
         full_store.compile()
         packs.append(full_store)
-
     smallest_pack = min(packs, key=lambda p: p.string_buffer_size())
     smallest_pack.write_to_file(output_file_name)
+
+
+def build(
+    input_file_names: List, output_file_name: str, id_finder: IdFinder, plural_handler
+):
+    translation_dict = TranslationDict()
+    for input_file_name in input_file_names:
+        locale = extract_locale_from_file_name(input_file_name)
+        translation_dict.add_for_locale(
+            locale,
+            read_string_dict(locale, input_file_name, id_finder, plural_handler),
+        )
+    build_with_dict(output_file_name, translation_dict)
+
+
+def get_unused_resource(nullified_resource: str) -> List[str]:
+    with open(nullified_resource, "r") as file:
+        lines = file.read().splitlines()
+        return [line[line.rfind(".") + 1 :] for line in lines]
+
+
+def repack(
+    resource_config: str, original_pack: str, nullified_resource: str, output: str
+) -> None:
+    translation = TranslationDict()
+    input_dict = StringPack.from_file(original_pack)
+    translation.add_translation(input_dict)
+    id_finder = IdFinder.from_resource_config(resource_config)
+    unused_resource = get_unused_resource(nullified_resource)
+    translation.remove_unused_translation(id_finder, unused_resource)
+    build_with_dict(output, translation)
+
+
+def main():
+    arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument(
+        "--resource-config",
+        help="Location of Android resource config file mapping used by --stable-ids.",
+    )
+    arg_parser.add_argument(
+        "--original-pack",
+        help="Location of original string pack files to be optimized.",
+    )
+    arg_parser.add_argument(
+        "--nullified-resource", help="Location of unused Android resource ids."
+    )
+    arg_parser.add_argument(
+        "--output-file", help="Location of output trimmed string pack file."
+    )
+
+    args = arg_parser.parse_args()
+    repack(
+        args.resource_config,
+        args.original_pack,
+        args.nullified_resource,
+        args.output_file,
+    )
+
+
+if __name__ == "__main__":
+    main()

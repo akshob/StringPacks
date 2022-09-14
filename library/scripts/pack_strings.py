@@ -11,53 +11,38 @@ import glob
 import logging
 import multiprocessing
 import os
-import re
 
 import string_pack
 import string_pack_config
+from id_finder import IdFinder
+from string_pack_config import LanguageHandlingCase, StringPackConfig
 
 
-class IdFinder(object):
-    def __init__(self, sp_config):
-        with open(sp_config.pack_ids_class_file_path, "rt") as fd:
-            self.id_data = fd.read()
-        all_matches = re.findall(
-            r"R\.(?:string|plurals)(?:.*?)\.(\w+),", self.id_data, flags=re.DOTALL
-        )
-        self.seen_ids = {}
-        for i in range(0, len(all_matches)):
-            self.seen_ids[all_matches[i]] = i
+def group_string_files_by_languages(
+    sp_config: StringPackConfig, packable_strings_file_paths
+):
 
-    def get_id(self, resource_name):
-        if resource_name in self.seen_ids:
-            return self.seen_ids[resource_name]
-        return None
-
-
-def group_string_files_by_languages(pack_id_mapping, packable_strings_file_paths):
     # A map from language (aka, pack ID) to list of string resource files.
     grouped_files = collections.defaultdict(list)
 
     for strings_file in packable_strings_file_paths:
         values_dir_name = os.path.normpath(strings_file).split(os.sep)[-2]
         language = values_dir_name.replace("values-", "")
-
-        pack_id = pack_id_mapping.get(language, language)
-
-        grouped_files[pack_id].append(strings_file)
+        handler_case = sp_config.get_handling_case(language)
+        if handler_case == LanguageHandlingCase.PACK:
+            pack_id = sp_config.pack_id_mapping.get(language, language)
+            grouped_files[pack_id].append(strings_file)
 
     return grouped_files
 
 
-def get_dest_pack_file_path(sp_config, pack_id):
+def get_dest_pack_file_path(sp_config: StringPackConfig, pack_id):
     prefix = "" if sp_config.module is None else (sp_config.module + "_")
-    return os.path.join(
-        sp_config.assets_directory, "%sstrings_%s.pack" % (prefix, pack_id)
-    )
+    return os.path.join(sp_config.assets_directory, f"{prefix}strings_{pack_id}.pack")
 
 
-def pack_strings(sp_config, plural_handler):
-    id_finder = IdFinder(sp_config)
+def pack_strings(sp_config: StringPackConfig, plural_handler):
+    id_finder = IdFinder.from_stringpack_config(sp_config)
     packable_strings_file_paths = set()
 
     moved = []
@@ -70,7 +55,7 @@ def pack_strings(sp_config, plural_handler):
         )
 
     grouped_strings_file_paths = group_string_files_by_languages(
-        sp_config.pack_id_mapping, packable_strings_file_paths
+        sp_config, packable_strings_file_paths
     )
 
     # Create assets directory in case it does not exist.
@@ -83,7 +68,11 @@ def pack_strings(sp_config, plural_handler):
 
 class PackBuilder(object):
     def __init__(
-        self, sp_config, grouped_strings_file_paths, id_finder, plural_handler
+        self,
+        sp_config: StringPackConfig,
+        grouped_strings_file_paths,
+        id_finder,
+        plural_handler,
     ):
         self.sp_config = sp_config
         self.grouped_strings_file_paths = grouped_strings_file_paths
